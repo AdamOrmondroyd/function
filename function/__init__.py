@@ -1,1 +1,3 @@
-import  jax
+import jax
+
+jax.numpy
