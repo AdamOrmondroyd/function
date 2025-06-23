@@ -1,4 +1,4 @@
-# `function`
+# [`function`](function.png "function")
 
 ## Notes
 - `jax` CMB likelihoods: [clipy](https://github.com/benabed/clipy)
