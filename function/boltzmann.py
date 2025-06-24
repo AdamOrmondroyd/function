@@ -1,10 +1,17 @@
+from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 from jax.numpy import pi, ndarray
-from jax.dataclasses import pytree_dataclass
+from jax.tree_util import register_dataclass
 from functools import partial
 
 # TODO: Thomson scattering cross-section for electrons - check units
+
+
+def pytree_dataclass(cls):
+    cls = dataclass(cls)
+    register_dataclass(cls)
+    return cls
 
 
 @pytree_dataclass
@@ -37,30 +44,36 @@ class Radiation:
 @pytree_dataclass
 class MasslessNeutrino:
     f: ndarray  # (lmax+1,)
-    delta: float
-    theta: float
+
+    @property
+    def delta(self):
+        return self.f[0]
+
+    @property
+    def sigma(self):
+        return self.f[2] / 2
+
+    def theta(self, k):
+        return 3 * k * self.f[1] / 4
 
 
 @pytree_dataclass
 class MassiveNeutrino:
     psi: ndarray  # shape (nq, lmax+1)
-    # compute delta/theta/sigma via quadrature later
+    delta_rho: float
+    delta_p: float
+    theta: float
+    sigma: float
 
 
 @pytree_dataclass
 class Background:
     rho_r: float
-    rho_m: float
+    rho_b: float
     rho_l: float
-
-
-@pytree_dataclass
-class Params:
-    h0: float  # Hubble constant today
-    omm: float  # Omega_matter
-    omb: float  # Omega_baryon
-    omr: float  # Omega_radiation
-    omnu: float  # Omega_massless_neutrino
+    rho_nu: float
+    p_nu: float
+    rho_mnu: float
 
 
 @pytree_dataclass
@@ -73,6 +86,29 @@ class Cosmology:
     r: Radiation
     nu: MasslessNeutrino
     mnu: MassiveNeutrino
+
+
+@pytree_dataclass
+class Params:
+    h0: float
+    omr: float
+    ombh2: float
+    omch2: float
+    mnu: jnp.array  # e.g. [0.06, 0.0, 0.0]
+    G: float = 6.67430e-11
+
+
+def initialise(params: Params, k, tau_i):
+    pass
+    # compute rho_i0 = Omih2 * 3H0^2/8πG
+    # rho_crit0 = 3 * params.h0**2 / (8 * pi * params.G)
+    # rho_b0 = params.ombh2 / params.h0**2 * rho_crit0
+    # rho_c0 = params.omch2 / params.h0**2 * rho_crit0
+    # a_i =
+
+
+def background(tau, params: Params) -> Background:
+    """Background cosmology."""
 
 
 def metric(a, hubble, metric: Metric, deltaT00, deltaTii, k):
@@ -218,7 +254,7 @@ def radiation(r, b, metric, ne, sigmaT, a, k, t):
 
 
 # Massless neutrinos
-def _massless_nu_moment_rhs(ell, fl, f_all, h_dot, eta_dot, k, tau, theta_nu):
+def _massless_nu_moment_rhs(ell, fl, f_all, hdot, etadot, k, tau):
     # ell = multipole index, 0 .. L
     L = f_all.shape[0] - 1
 
@@ -228,24 +264,19 @@ def _massless_nu_moment_rhs(ell, fl, f_all, h_dot, eta_dot, k, tau, theta_nu):
 
     # ell=0
     def case0(_):
-        # dF0 = -k F1 + (4/3) h_dot
-        return -k * f_next + (4.0 / 3.0) * h_dot
+        # dF0 = -k F1 + (4/3) hdot
+        return -k * f_next + (4.0 / 3.0) * hdot
 
     # ell=1
     def case1(_):
-        # dF1 = (k/3)*(F0 - 2 F2) + (4/3)*k*eta_dot
-        return (k / 3.0) * (f_all[0] - 2.0 * f_all[2]) + (4.0 / 3.0) * k * eta_dot
+        # dF1 = (k/3)*(F0 - 2 F2) + (4/3)*k*etadot
+        return (k / 3.0) * (f_all[0] - 2.0 * f_all[2]) + (4.0 / 3.0) * k * etadot
 
     # ell=2
     def case2(_):
-        # dF2 = (8/15)*theta_nu - (3/5)*k*F3
-        #      + (4/15)*h_dot + (8/5)*eta_dot
-        return (
-            (8.0 / 15.0) * theta_nu
-            - (3.0 / 5.0) * k * f_all[3]
-            + (4.0 / 15.0) * h_dot
-            + (8.0 / 5.0) * eta_dot
-        )
+        # Only free streaming: no theta_nu term!
+        # dF₂ = (k/5) (2F₁ - 3F₃)
+        return (k / 5.0) * (2.0 * f_all[1] - 3.0 * f_all[3])
 
     # general 3 <= ell < L
     def case_general(_):
@@ -261,44 +292,38 @@ def _massless_nu_moment_rhs(ell, fl, f_all, h_dot, eta_dot, k, tau, theta_nu):
     return jax.lax.switch(ell, branches, operand=None)
 
 
-def massless_nu_rhs(nu, metric, k, t):
+def massless_nu_rhs(nu, metric_dot, k, tau):
     """
-    nu.F     : array of shape (L+1,)
+    nu.f     : array of shape (L+1,)
     nu.delta : array scalar
     nu.theta : array scalar
-    metric.h_dot   : array scalar
-    metric.eta_dot : array scalar
+    metric_dot.h   : array scalar
+    metric_dot.eta : array scalar
     """
     f = nu.f
-    delta = nu.delta
-    theta = nu.theta
-    h_dot = metric.h_dot
-    eta_dot = metric.eta_dot
+    hdot = metric_dot.h
+    etadot = metric_dot.eta
 
     # fluid moments
-    delta_dot = -4.0 / 3.0 * theta - 2.0 / 3.0 * h_dot
-    theta_dot = k**2 * (0.25 * delta - 0.5 * f[2])
-
     # prepare for vmap over ell = 0..L
     ells = jnp.arange(f.shape[0])
 
     moment_fun = partial(
         _massless_nu_moment_rhs,
         f_all=f,
-        h_dot=h_dot,
-        eta_dot=eta_dot,
+        hdot=hdot,
+        etadot=etadot,
         k=k,
-        t=t,
-        theta_nu=nu.theta,
+        tau=tau,
     )
 
     fdot = jax.vmap(moment_fun, in_axes=(0, 0))(ells, f)
 
-    return MasslessNeutrino(f=fdot, delta=delta_dot, theta=theta_dot)
+    return MasslessNeutrino(f=fdot)
 
 
 # Massive neutrinos
-def _massive_nu_moment_rhs(ell, psi_ell, psi_all, k, q, eps, df0, h_dot, eta_dot, tau):
+def _massive_nu_moment_rhs(ell, psi_ell, psi_all, k, q, eps, df0, hdot, etadot, tau):
     # ell = 0..L
     L = psi_all.shape[0] - 1
 
@@ -308,8 +333,8 @@ def _massive_nu_moment_rhs(ell, psi_ell, psi_all, k, q, eps, df0, h_dot, eta_dot
 
     # ell = 0
     def case0(_):
-        # psi0' = - (q k / eps) psi1 + (1/6) h_dot * dlnf0
-        return -(q * k / eps) * psi_next + (1.0 / 6.0) * h_dot * df0
+        # psi0' = - (q k / eps) psi1 + (1/6) hdot * dlnf0
+        return -(q * k / eps) * psi_next + (1.0 / 6.0) * hdot * df0
 
     # ell = 1
     def case1(_):
@@ -319,9 +344,9 @@ def _massive_nu_moment_rhs(ell, psi_ell, psi_all, k, q, eps, df0, h_dot, eta_dot
     # ell = 2
     def case2(_):
         # psi2' = (q k)/(5 eps)*(2 psi1 - 3 psi3)
-        #        - [ (1/15)h_dot + (2/5)eta_dot ] * dlnf0
+        #        - [ (1/15)hdot + (2/5)etadot ] * dlnf0
         term1 = (q * k) / (5.0 * eps) * (2.0 * psi_all[1] - 3.0 * psi_all[3])
-        term2 = -((1.0 / 15.0) * h_dot + (2.0 / 5.0) * eta_dot) * df0
+        term2 = -((1.0 / 15.0) * hdot + (2.0 / 5.0) * etadot) * df0
         return term1 + term2
 
     # 3 <= ell < L
@@ -344,7 +369,7 @@ def _massive_nu_moment_rhs(ell, psi_ell, psi_all, k, q, eps, df0, h_dot, eta_dot
 def massive_nu_rhs(
     mnu,
     bg,  # background object with bg.rho_nu, bg.p_nu
-    metric,  # metric.h_dot, metric.eta_dot
+    metric_dot,  # metric.hdot, metric.etadot
     k,
     a,
     m_nu,
@@ -363,8 +388,8 @@ def massive_nu_rhs(
       sigma     : scalar sigma_nu
     """
     psi = mnu.psi
-    h_dot = metric.h_dot
-    eta_dot = metric.eta_dot
+    hdot = metric_dot.h
+    etadot = metric_dot.eta
     nq, L1 = psi.shape
 
     # evolve each momentum bin
@@ -378,8 +403,8 @@ def massive_nu_rhs(
             q=q,
             eps=eps,
             df0=df0,
-            h_dot=h_dot,
-            eta_dot=eta_dot,
+            hdot=hdot,
+            etadot=etadot,
             tau=tau,
         )
         # vmap over ell and psi_ell
@@ -390,7 +415,7 @@ def massive_nu_rhs(
 
     # now form the fluid moments via quadrature
     eps_arr = jnp.sqrt(q_arr**2 + (a * m_nu) ** 2)
-    prefac = 4.0 * jnp.pi / a**4
+    prefac = 4.0 * pi / a**4
 
     # density perturbation
     delta_rho = prefac * jnp.sum(w_arr * q_arr**2 * eps_arr * psi[:, 0])
@@ -399,11 +424,11 @@ def massive_nu_rhs(
     delta_p = prefac / 3.0 * jnp.sum(w_arr * q_arr**4 / eps_arr * psi[:, 1])
 
     # (rho+P) theta
-    theta_num = 4.0 * jnp.pi * k / a**4 * jnp.sum(w_arr * q_arr**3 * psi[:, 1])
+    theta_num = 4.0 * pi * k / a**4 * jnp.sum(w_arr * q_arr**3 * psi[:, 1])
 
     # (rho+P) sigma
     sigma_num = (
-        8.0 * jnp.pi / (3.0 * a**4) * jnp.sum(w_arr * q_arr**4 / eps_arr * psi[:, 2])
+        8.0 * pi / (3.0 * a**4) * jnp.sum(w_arr * q_arr**4 / eps_arr * psi[:, 2])
     )
 
     rho_plus_p = bg.rho_nu + bg.p_nu
@@ -450,7 +475,7 @@ def eb(t, state: Cosmology, k, params):
 
     nu_dot = massless_nu_rhs(state.nu, state.metric, k, t)
     mnu_dot = massive_nu_rhs(
-        state.mnu, state.metric, params.w(k), a, params.q, params.w, params.df0dlnq, t
+        state.mnu, metric_dot, params.w(k), a, params.q, params.w, params.df0dlnq, t
     )
 
     Cosmology(
